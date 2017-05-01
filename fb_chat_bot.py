@@ -1,5 +1,4 @@
 ﻿from lxml import html
-from lxml.cssselect import CSSSelector
 from urllib import request
 import requests
 import threading
@@ -12,10 +11,7 @@ import random
 import re
 import time
 import calendar
-import io
 import urllib
-
-from fbchat.models import Like
 import stats
 import quiz
 import consts
@@ -25,105 +21,117 @@ STATS_FILE = "stats.json"
 
 
 class ArnoldBot(fbchat.Client):
-    def __init__(self, email, password, thread_fbid, config):
+    def __init__(self, email, password, config):
+        # Setup bot
         self.stats = stats
         self.config = config
         self.commands = config[consts.COMMANDS]
-
         self.stats = stats.Stats(STATS_FILE)
 
-        fbchat.Client.__init__(self, email, password, thread_fbid, True, None)
-        threads = self.getThreadList(0)
-        for item in threads:
-            if item.thread_fbid == thread_fbid:
-                thread = item
+        # Init fbchat
+        fbchat.Client.__init__(self, email, password, info_log=True, debug=False)
+        self.setDefaultRecipient(config["thread_fbid"], False)
+        self.listen()
 
-        # Extracts ids from participants and gets full data
-        users = []
-        for user_id in thread.participants:
-            if user_id.startswith("fbid:"):
-                users.append(user_id[5:])
-        self.full_users = self.getUserInfo(users)
-        
+        # Read values from file
         self.annoy_list = self.stats.vals["annoy_list"]
         self.onseen_list = self.stats.vals["onseen_list"]
 
-        self.mquiz = quiz.Quiz(config["quiz_file"], self.stats)
-        self.__quiz_question_count = 0
-        self.__quiz_timeout_set = False
-        self.__quiz_timer = None
-        
+        # Set up quiz
+        # self.mquiz = quiz.Quiz(config["quiz_file"], self.stats)
+        # self.__quiz_question_count = 0
+        # self.__quiz_timeout_set = False
+        # self.__quiz_timer = None
 
-        
-    def on_message(self, author_id, message, attachements, mid, metadata):
-        self.markAsDelivered(author_id, mid)  # mark delivered
-        self.markAsRead(author_id)  # mark read
+        # Extracts ids from participants and gets full data
+        # threads = self.getThreadList(0)
+        # for thread in threads:
+        #     for user in thread.participants:
+        #     if user_id.startswith("fbid:"):
+        #         threads.append(user_id[5:])
+        # self.full_users = self.getUserInfo(threads)
 
-        # Relays private messages from OPs
-        if self.is_operator(author_id):
-            self.group_send(message)
 
-    def on_group_message(self, thread_fbid, author_id, message, attachements, mid, metadata):
+    def on_listening(self):
+        """Send a message once it starts listening."""
+        self.send_default(self.config["on_login"])
+
+
+    def on_message_new(self, mid, author_id, message, metadata, recipient_id, thread_type):
+        """Filters any new incoming message."""
         self.markAsDelivered(author_id, mid)
         self.markAsRead(author_id)
 
-        # Message from myself, therefore I sent a message
-        if author_id == self.uid: self.stats.updateMessagesSent()
+        # I received a message from myself, therefore I sent it
+        if author_id == str(self.uid) and recipient_id == self.config["thread_fbid"]:
+            self.stats.updateMessagesSent()
+            return
 
-        # If my group and not from myself
-        if str(thread_fbid) == self.thread_fbid and author_id != self.uid:
+        # If message is from one of operator - relays it back to chat
+        if str(recipient_id) != self.config["thread_fbid"] and self.is_operator(author_id):
+            self.send_default(message)
+            return
 
-            is_command = False
+        # Message is from my group, do my bot things
+        if str(recipient_id) == self.config["thread_fbid"]:
+            self.respond_in_group(author_id, message)
 
-            # Commands
-            if message.startswith("!"):
-                self.log("%s sent message: '%s'" % (self.fbidToNameCode(author_id), message))
 
-                parts = message.split(" ", 1)
-                command_name = parts[0].lower()
-                command_args = parts[1] if len(parts) == 2 else None
+    def respond_in_group(self, author_id, message):
+        is_command = False
 
-                command = self.getCommand(command_name)
+        # Commands
+        if message.startswith("!"):
+            # self.log("%s sent message: '%s'" % (self.fbidToNameCode(author_id), message))
 
-                try:
-                    if command:  # Command found
-                        if command[consts.Cmd.IS_OPER]:  # Command is for operators
-                            if self.is_operator(author_id):  # User is operator
-                                getattr(self, command[consts.Cmd.ENTRY_METHOD])(author_id, command, command_args)
-                            else:  # User is not operator
-                                self.group_send(config[consts.COMMAND_ERROR_OPER])
-                        else:  # Not operator command
+            parts = message.split(" ", 1)
+            command_name = parts[0].lower()
+            command_args = parts[1] if len(parts) == 2 else None
+
+            command = self.getCommand(command_name)
+
+            try:
+                if command:  # Command found
+                    if command[consts.Cmd.IS_OPER]:  # Command is for operators
+                        if self.is_operator(author_id):  # User is operator
                             getattr(self, command[consts.Cmd.ENTRY_METHOD])(author_id, command, command_args)
+                        else:  # User is not operator
+                            self.send_default(self.config[consts.COMMAND_ERROR_OPER])
+                    else:  # Not operator command
+                        getattr(self, command[consts.Cmd.ENTRY_METHOD])(author_id, command, command_args)
 
-                        self.stats.updateCommandsExecuted(self.fbidToNameCode(author_id), command_name)
-                    else:
-                        self.cmd_simple(author_id, command_name, command_args)
-                        
-                    is_command = True
+                    # self.stats.updateCommandsExecuted(self.fbidToNameCode(author_id), command_name)
+                else:
+                    self.cmd_simple(author_id, command_name, command_args)
 
-                except:  # Command not found
-                    self.command_log_error()
+                is_command = True
 
-            # Quiz in progress
-            elif self.__quiz_timeout_set:
-                self.quizGuess(author_id, message)
+            except:  # Command not found
+                self.command_log_error()
 
-            if not is_command: self.global_responder(message.lower(), author_id)
+        # Quiz in progress
+        # elif self.__quiz_timeout_set:
+        #     self.quizGuess(author_id, message)
 
-            self.annoy(author_id)
+        if not is_command:
+            self.global_responder(author_id, message)
 
-    def on_group_seen(self, thread_fbid, author_id, time_seen, metadata):
-        if str(thread_fbid) == self.thread_fbid and author_id != self.uid:
-            # !onseen command
-            for item in self.onseen_list:
-                if author_id == item["to_id"]:
-                    addressing_name = self.getAddressingName(self.fbidToNameCode(author_id))
-                    from_nickname = self.getNickname(item["from"])
-                    msg = self.commands["onseen"]["txt_onseen"] % (addressing_name, from_nickname, item["text"])
-                    self.group_send(msg)
-                    self.onseen_list.remove(item)
-                    self.stats.makeDirty()
-                    break
+        # self.annoy(author_id)
+
+
+    # def on_group_seen(self, thread_fbid, author_id, time_seen, metadata):
+    #     if str(thread_fbid) == self.thread_fbid and author_id != self.uid:
+    #         # !onseen command
+    #         for item in self.onseen_list:
+    #             if author_id == item["to_id"]:
+    #                 addressing_name = self.getAddressingName(self.fbidToNameCode(author_id))
+    #                 from_nickname = self.getNickname(item["from"])
+    #                 msg = self.commands["onseen"]["txt_onseen"] % (addressing_name, from_nickname, item["text"])
+    #                 self.send_default(msg)
+    #                 self.onseen_list.remove(item)
+    #                 self.stats.makeDirty()
+    #                 break
+
 
     def getCommand(self, command_name):
         """Returns a dict of given command with all related info. None if command not found"""
@@ -133,19 +141,20 @@ class ArnoldBot(fbchat.Client):
                     return self.commands[command[0]]
         except:
             return None
-        
-    def global_responder(self, message, author_id):
-        """Responds, if there are words that match trigger words regex"""
 
-        items = config["respond_to_words"]
+
+    def global_responder(self, author_id, message):
+        """Checks if there are words matching respondable words in config, then responds."""
+
+        items = self.config["respond_to_words"]
         matches_lists = []
         message = message.lower()
         # If there are more than few matched lists, stores them
         for i, item in enumerate(items):
             # If user list is not empty checks if message is from given user
             # Doesn't find the author so goes to another set
-            if item["for_users"] and self.fbidToNameCode(author_id) not in item["for_users"]:
-                continue
+            # if item["for_users"] and self.fbidToNameCode(author_id) not in item["for_users"]:
+            #     continue
 
             for word in item["triggers"]:
                 # Check if only for specific users
@@ -160,27 +169,29 @@ class ArnoldBot(fbchat.Client):
             rnd_set = matches_lists[rnd]
             rnd = random.randint(1, len(items[rnd_set]["answers"])) - 1
 
-            name_code = self.fbidToNameCode(author_id)
-            address_name = self.getAddressingName(name_code)
-            nickname = self.getNickname(name_code)
+            # name_code = self.fbidToNameCode(author_id)
+            # address_name = self.getAddressingName(name_code)
+            # nickname = self.getNickname(name_code)
 
             response = items[rnd_set]["answers"][rnd]
-            response = response.format(addr_name = address_name, nick = nickname)
+            # response = response.format(addr_name = address_name, nick = nickname)
 
-            self.group_send(response)
+            self.send_default(response)
+
 
     def annoy(self, author_id):
         """If person from annoy list writes a message - responds"""
         for item in self.annoy_list:
             if author_id == item["fbid"]:
                 if item["count"] > 0:
-                    self.group_send(item["text"])
+                    self.send_default(item["text"])
                     item["count"] -= 1
                     break
                 else:
-                    self.group_send(config["commands"]["annoy"]["txt_annoy_done"])
+                    self.send_default(self.config["commands"]["annoy"]["txt_annoy_done"])
                     self.annoy_list.remove(item)
                     break
+
 
     def command_log(self, command, param = None):
         ''' Formats command with parameters and sends to be logged
@@ -198,17 +209,19 @@ class ArnoldBot(fbchat.Client):
             else:
                 msg += str(param)
 
-        self.log(msg)
+        print(msg)
+
 
     def command_log_error(self, error = ""):
         ''' Logs an unrecognized command or some other error and sends info to chat '''
-        self.log("Unrecognized command. " + error)
-        self.group_send(config["command_error"])
-        self.group_send(error)
+        return
+        print("Unrecognized command. " + error)
+        self.send_default(self.config["command_error"])
+        self.send_default(error)
         self.stats.updateCommandsError()
 
-    def on_listening(self):
-        self.group_send(config["on_login"])
+
+
 
     def quizRevealLetter(self, timer):
         """Reveals letter for quiz if answers are accepted and restarts timer"""
@@ -219,17 +232,18 @@ class ArnoldBot(fbchat.Client):
                 timer.args = (timer,)
                 self.__quiz_timer = timer
                 self.__quiz_timer.start()
-                self.group_send(self.mquiz.getHiddenAnswer())
+                self.send_default(self.mquiz.getHiddenAnswer())
             else:
                 timer.cancel()
                 self.__quiz_timer = None
                 self.__quiz_timeout_set = False
                 msg = self.commands["quiz"]["timeout_text"] % self.mquiz.getAnswer()
-                self.group_send(msg)
+                self.send_default(msg)
+
 
     def quizGiveQuestion(self):
         """Gives quiz question and sets a timer to reveal letters"""
-        self.group_send("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
+        self.send_default("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
 
         if not self.__quiz_timeout_set:
             timer = threading.Timer(self.commands["quiz"]["timeout"], self.quizRevealLetter)
@@ -237,6 +251,7 @@ class ArnoldBot(fbchat.Client):
             self.__quiz_timer = timer
             self.__quiz_timer.start()
             self.__quiz_timeout_set = True
+
 
     def quizGuess(self, author_id, message):
         """Makes a quiz guess and shows new question if guess is correct"""
@@ -247,7 +262,7 @@ class ArnoldBot(fbchat.Client):
             if points:
                 nickname = self.getNickname(self.fbidToNameCode(author_id))
                 msg = self.commands["quiz"]["guess_correct"] % (nickname, str(points))
-                self.group_send(msg)
+                self.send_default(msg)
                 self.__quiz_timer.cancel()
                 self.__quiz_timer = None
                 self.__quiz_timeout_set = False
@@ -259,12 +274,12 @@ class ArnoldBot(fbchat.Client):
         try:
             value = self.commands["simple_commands"]["commands"][command_name]
 
-            if args == None: args = 0
+            args = None or 0
             args = int(args)
 
             msg = self.commands["simple_commands"]["commands"][command_name][args]
-            self.stats.updateCommandsExecuted(self.fbidToNameCode(author_id), command_name)
-            self.group_send(msg)
+            # self.stats.updateCommandsExecuted(self.fbidToNameCode(author_id), command_name)
+            self.send_default(msg)
         except:
             self.command_log_error()
 
@@ -285,7 +300,7 @@ class ArnoldBot(fbchat.Client):
                 if i == " ": msg += u"　"
                 else: msg += chr(0xFEE0 + ord(i))
 
-            self.group_send(msg)
+            self.send_default(msg)
 
         except:
             self.command_log_error()
@@ -301,7 +316,7 @@ class ArnoldBot(fbchat.Client):
 
             msg = command[consts.Cmd.TXT_EXECUTED].format(uptime = uptime, times_launched = times_launched,\
                 commands_executed = commands_executed, commands_error = commands_error, messages_sent = messages_sent)
-            self.group_send(msg)
+            self.send_default(msg)
 
         except:
             self.command_log_error()
@@ -309,7 +324,7 @@ class ArnoldBot(fbchat.Client):
     def cmd_on(self, author_id, command, args):
         """Shows if bot is online right now"""
         try:
-            self.group_send(command[consts.Cmd.TXT_EXECUTED] % self.stats.vals["current_uptime"])
+            self.send_default(command[consts.Cmd.TXT_EXECUTED] % self.stats.vals["current_uptime"])
 
         except:
             self.command_log_error()
@@ -325,7 +340,7 @@ class ArnoldBot(fbchat.Client):
             with open(CONFIG_FILE, "w", encoding = "utf-8") as outfile:
                 json.dump(self.config, outfile, indent = "\t", ensure_ascii = False)
 
-            self.group_send(command[consts.Cmd.TXT_EXECUTED] % args)
+            self.send_default(command[consts.Cmd.TXT_EXECUTED] % args)
 
         except:
             self.command_log_error()
@@ -341,7 +356,7 @@ class ArnoldBot(fbchat.Client):
             with open(CONFIG_FILE, "w", encoding = "utf-8") as outfile:
                 json.dump(self.config, outfile, indent = "\t", ensure_ascii = False)
 
-            self.group_send(command[consts.Cmd.TXT_EXECUTED] % args)
+            self.send_default(command[consts.Cmd.TXT_EXECUTED] % args)
 
         except:
             self.command_log_error()
@@ -409,7 +424,7 @@ class ArnoldBot(fbchat.Client):
             msg += command["txt_executed"] % ("Panevėžyje", td_temp_pnvz, td_type_pnvz,\
                 tmrw_day_temp_pnvz, tmrw_day_type_pnvz, tmrw_night_temp_pnvz, tmrw_night_type_pnvz)
 
-            self.group_send(msg)
+            self.send_default(msg)
             pass
         except:
             self.command_log_error()
@@ -434,7 +449,7 @@ class ArnoldBot(fbchat.Client):
 
             # Page not found
             if response["result_type"] == "no_results":
-                self.group_send(command["txt_error"])
+                self.send_default(command["txt_error"])
                 return
 
             if count < 1: count = 1
@@ -450,7 +465,7 @@ class ArnoldBot(fbchat.Client):
                 msg += command[consts.Cmd.TXT_EXECUTED] % ((i + 1), word, definition, example)
             
             msg += response["list"][0]["permalink"]
-            self.group_send(msg)
+            self.send_default(msg)
         except:
             self.command_log_error()
 
@@ -470,14 +485,14 @@ class ArnoldBot(fbchat.Client):
 
             # Page not found
             if "-1" in extract:
-                self.group_send(command["txt_error"])
+                self.send_default(command["txt_error"])
                 return
             extract = next(iter(extract.values()))
 
             url_to_add = "https://en.wikipedia.org/wiki/" + args
             msg = extract["extract"] + "\n" + url_to_add
             
-            self.group_send(msg)
+            self.send_default(msg)
         except:
             self.command_log_error()
 
@@ -490,7 +505,8 @@ class ArnoldBot(fbchat.Client):
                 unfair_list += [key] * int(value)
 
             msg = random.choice(unfair_list)
-            self.group_send(msg, like = Like.small)
+            self.send_default(msg)
+            # self.send_defaultLike(like = Like.small)
 
 
         except:
@@ -501,8 +517,8 @@ class ArnoldBot(fbchat.Client):
         try:
             args = int(args)
             roll = random.randint(0, args)
-            msg = command[consts.Cmd.TXT_EXECUTED] % (self.getNickname(self.fbidToNameCode(author_id)), roll)
-            self.group_send(msg)
+            msg = command[consts.Cmd.TXT_EXECUTED] #  % (self.getNickname(self.fbidToNameCode(author_id)), roll)
+            self.send_default(msg)
 
 
         except:
@@ -525,7 +541,7 @@ class ArnoldBot(fbchat.Client):
             self.onseen_list.append(list_item)
             self.stats.makeDirty()
 
-            self.group_send(command["txt_executed"])
+            self.send_default(command["txt_executed"])
 
         except:
             self.command_log_error()
@@ -543,9 +559,9 @@ class ArnoldBot(fbchat.Client):
                 command["commands"][new_command_name] = [args[1]]
 
             with open(CONFIG_FILE, "w", encoding = "utf-8") as outfile:
-                json.dump(config, outfile, indent = "\t", ensure_ascii = False)
+                json.dump(self.config, outfile, indent = "\t", ensure_ascii = False)
 
-            self.group_send(command[consts.Cmd.TXT_EXECUTED] % new_command_name)
+            self.send_default(command[consts.Cmd.TXT_EXECUTED] % new_command_name)
 
         except:
             self.command_log_error()
@@ -563,13 +579,13 @@ class ArnoldBot(fbchat.Client):
             for key, val in command[consts.Cmd.ARGS].items():
                 if val == args:
                     if key == "help":
-                        self.group_send(command["help"])
+                        self.send_default(command["help"])
                         self.command_log(command[consts.Cmd.NAME], args)
 
                     elif key == "repeat_question":
                         self.command_log(command[consts.Cmd.NAME], args)
                         if self.__quiz_timeout_set:
-                            self.group_send("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
+                            self.send_default("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
                         else:
                             self.quizGiveQuestion()
 
@@ -584,13 +600,13 @@ class ArnoldBot(fbchat.Client):
                             msg = command["user_stats_text"].format(name = self.fbidToName(author_id), **stats)
                         else:
                             msg = command["user_not_played"]
-                        self.group_send(msg)
+                        self.send_default(msg)
 
                     elif key == "global_stats":
                         self.command_log(command[consts.Cmd.NAME], args)
                         stats = self.mquiz.getGlobalStats()
                         msg = command["global_stats_text"].format(**stats)
-                        self.group_send(msg)
+                        self.send_default(msg)
 
                     elif key == "top_3":
                         self.command_log(command[consts.Cmd.NAME], args)
@@ -599,7 +615,7 @@ class ArnoldBot(fbchat.Client):
                         msg = command["top_text"]
                         for i, user in enumerate(users):
                             msg += command["top_position_text"] % (str(i + 1), user[0], user[1][quiz.POINTS])
-                        self.group_send(msg)
+                        self.send_default(msg)
 
                     break
             # Command not found, it is a guess
@@ -627,7 +643,7 @@ class ArnoldBot(fbchat.Client):
 
             self.command_log(command[consts.Cmd.NAME], args)
 
-            self.group_send(command[consts.Cmd.TXT_EXECUTED])
+            self.send_default(command[consts.Cmd.TXT_EXECUTED])
 
         except:
             self.command_log_error()
@@ -637,29 +653,30 @@ class ArnoldBot(fbchat.Client):
         for item in self.annoy_list:
             if item["fbid"] == author_id:
                 self.command_log(command[consts.Cmd.NAME])
-                self.group_send(command[consts.Cmd.TXT_EXECUTED])
+                self.send_default(command[consts.Cmd.TXT_EXECUTED])
                 self.annoy_list.remove(item)
-                break;
+                break
 
     def cmd_say(self, author_id, command, args):
         """Repeats what user said"""
         if args:
             self.command_log(command[consts.Cmd.NAME], args)
-            self.group_send(args)
+            self.send_default(args)
         else:
             self.command_log(command[consts.Cmd.NAME])
-            self.group_send(command[consts.Cmd.TXT_ARGS_ERROR])
+            self.send_default(command[consts.Cmd.TXT_ARGS_ERROR])
 
     def cmd_updateconfig(self, author_id, command, args):
         """Updates config with new values"""
         try:
             with open(CONFIG_FILE, encoding = "utf-8") as infile:
                 new_config = json.load(infile)
-            config.update(new_config)
+            self.config.update(new_config)
+            self.commands.update(new_config["commands"])
             self.command_log(command[consts.Cmd.NAME])
-            self.group_send(command[consts.Cmd.TXT_EXECUTED])
+            self.send_default(command[consts.Cmd.TXT_EXECUTED])
         except Exception as e:
-            self.group_send(e)
+            self.send_default(e)
             self.command_log_error()
 
     def cmd_savestats(self, author_id, command, args):
@@ -668,9 +685,9 @@ class ArnoldBot(fbchat.Client):
             self.stats.updateCommandsExecuted(self.fbidToNameCode(author_id), command[consts.Cmd.NAME])
             self.stats.updateStats()
             self.command_log(command[consts.Cmd.NAME])
-            self.group_send(command[consts.Cmd.TXT_EXECUTED])
+            self.send_default(command[consts.Cmd.TXT_EXECUTED])
         except Exception as e:
-            self.group_send(e)
+            self.send_default(e)
             self.command_log_error()
 
 
@@ -682,14 +699,13 @@ class ArnoldBot(fbchat.Client):
         dtnow = datetime.datetime.now()
         local_time = time.localtime()
 
-        msg = time.strftime(command["txt_format"].decode("utf-8"), local_time)
-        # msg += "Unix time: %s\n\n" % str(int(now))
+        msg = time.strftime(command["txt_format"], local_time)
         cal = calendar.TextCalendar(calendar.MONDAY).formatmonth(dtnow.year, dtnow.month)
         cal = cal.replace("  ", "   ")
         cal = cal.replace("\n ", "\n  ")
         msg += cal
 
-        self.group_send(msg)
+        self.send_default(msg)
         
         
     def cmd_save_user_list(self, author_id, command, args):
@@ -697,7 +713,7 @@ class ArnoldBot(fbchat.Client):
         try:
             threads = self.getThreadList(0)
             for item in threads:
-                if item.thread_fbid == self.thread_fbid:
+                if item.thread_fbid == self.config["thread_fbid"]:
                     thread = item
 
             # Extracts ids from participants and gets full data
@@ -737,17 +753,17 @@ class ArnoldBot(fbchat.Client):
                     if val[consts.User.ID] == user_in_chat["id"]:
                         break
                 else:
-                    user_in_config[consts.User.IN_CHAT] = False
+                    self.user_in_config[consts.User.IN_CHAT] = False
                     marked_removed += 1
-                    
+
             with open(CONFIG_FILE, "w", encoding = "utf-8") as outfile:
                 json.dump(self.config, outfile, indent = "\t", ensure_ascii = False)
-            
 
-            self.group_send(command[consts.Cmd.TXT_EXECUTED] % (added, marked_in_chat, marked_removed))
+
+            self.send_default(command[consts.Cmd.TXT_EXECUTED] % (added, marked_in_chat, marked_removed))
 
         except Exception as e:
-            self.group_send(e)
+            self.send_default(e)
             self.command_log_error()
             
 
@@ -762,10 +778,10 @@ class ArnoldBot(fbchat.Client):
                     if cmd[1][consts.Cmd.SHORT] != "": msg += " (%s)" % cmd[1][consts.Cmd.SHORT]
                     msg += " - " + cmd[1][consts.Cmd.INFO] + "\n"
 
-            self.group_send(msg)
+            self.send_default(msg)
 
         except Exception as e:
-            self.group_send(e)
+            self.send_default(e)
             self.command_log_error()
 
 
@@ -815,7 +831,7 @@ class ArnoldBot(fbchat.Client):
 
     def is_operator(self, fbid):
         """Returns if given FBID is chatroom operator"""
-        return fbid in config["oper_fbid_list"]
+        return fbid in self.config["oper_fbid_list"]
 
 
 # Config and stats files provided via argument
@@ -823,10 +839,9 @@ if len(sys.argv) >= 3:
     CONFIG_FILE = sys.argv[1]
     STATS_FILE = sys.argv[2]
 
-with open(CONFIG_FILE, encoding = "utf-8") as infile:
-    config = json.load(infile)
+with open(CONFIG_FILE, encoding="utf-8") as infile:
+    my_config = json.load(infile)
 
-ctypes.windll.kernel32.SetConsoleTitleW(config["bot_name"])
+ctypes.windll.kernel32.SetConsoleTitleW(my_config["bot_name"])
 
-bot = ArnoldBot(config[consts.Config.EMAIL], config[consts.Config.PASSWORD], config[consts.Config.THREAD_FBID], config)
-bot.listen()
+bot = ArnoldBot(my_config[consts.Config.EMAIL], my_config[consts.Config.PASSWORD], my_config)
