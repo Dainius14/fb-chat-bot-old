@@ -4,7 +4,6 @@ import requests
 import threading
 import sys
 import json
-import ctypes
 import datetime
 import fbchat
 import random
@@ -15,6 +14,7 @@ import urllib
 import stats
 import quiz
 import consts
+import daemon
 
 CONFIG_FILE = "config.json"
 STATS_FILE = "stats.json"
@@ -31,7 +31,6 @@ class ArnoldBot(fbchat.Client):
         # Init fbchat
         fbchat.Client.__init__(self, email, password, info_log=True, debug=False)
         self.setDefaultRecipient(config["thread_fbid"], False)
-        self.listen()
 
         # Read values from file
         self.annoy_list = self.stats.vals["annoy_list"]
@@ -44,12 +43,17 @@ class ArnoldBot(fbchat.Client):
         # self.__quiz_timer = None
 
         # Extracts ids from participants and gets full data
-        # threads = self.getThreadList(0)
-        # for thread in threads:
-        #     for user in thread.participants:
-        #     if user_id.startswith("fbid:"):
-        #         threads.append(user_id[5:])
-        # self.full_users = self.getUserInfo(threads)
+        user_list = []
+        threads = self.getThreadList(0)
+        for thread in threads:
+            if thread.thread_fbid == config["thread_fbid"]:
+                for user in thread.participants:
+                    if user.startswith("fbid:"):
+                        user_list.append(user[5:])
+
+        self.full_users = self.getUserInfo(*user_list)
+        # Finally - listen
+        self.listen()
 
 
     def on_listening(self):
@@ -88,7 +92,7 @@ class ArnoldBot(fbchat.Client):
             command_name = parts[0].lower()
             command_args = parts[1] if len(parts) == 2 else None
 
-            command = self.getCommand(command_name)
+            command = self.get_command(command_name)
 
             try:
                 if command:  # Command found
@@ -133,7 +137,7 @@ class ArnoldBot(fbchat.Client):
     #                 break
 
 
-    def getCommand(self, command_name):
+    def get_command(self, command_name):
         """Returns a dict of given command with all related info. None if command not found"""
         try:
             for command in self.commands.items():
@@ -162,7 +166,6 @@ class ArnoldBot(fbchat.Client):
                     matches_lists.append(i)
                     break
 
-
         # There are triggers
         if len(matches_lists) > 0:
             rnd = random.randint(1, len(matches_lists)) - 1
@@ -174,7 +177,7 @@ class ArnoldBot(fbchat.Client):
             # nickname = self.getNickname(name_code)
 
             response = items[rnd_set]["answers"][rnd]
-            # response = response.format(addr_name = address_name, nick = nickname)
+            response = response.format(addr_name=self.fbidToName(author_id), nick=self.fbidToName(author_id))
 
             self.send_default(response)
 
@@ -221,14 +224,12 @@ class ArnoldBot(fbchat.Client):
         self.stats.updateCommandsError()
 
 
-
-
-    def quizRevealLetter(self, timer):
+    def quiz_reveal_letter(self, timer):
         """Reveals letter for quiz if answers are accepted and restarts timer"""
         if self.mquiz.acceptsAnswer():
             if self.mquiz.revealLetter():
                 # Restarts timer
-                timer = threading.Timer(self.commands["quiz"]["timeout"], self.quizRevealLetter)
+                timer = threading.Timer(self.commands["quiz"]["timeout"], self.quiz_reveal_letter)
                 timer.args = (timer,)
                 self.__quiz_timer = timer
                 self.__quiz_timer.start()
@@ -241,19 +242,19 @@ class ArnoldBot(fbchat.Client):
                 self.send_default(msg)
 
 
-    def quizGiveQuestion(self):
+    def quiz_give_question(self):
         """Gives quiz question and sets a timer to reveal letters"""
         self.send_default("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
 
         if not self.__quiz_timeout_set:
-            timer = threading.Timer(self.commands["quiz"]["timeout"], self.quizRevealLetter)
+            timer = threading.Timer(self.commands["quiz"]["timeout"], self.quiz_reveal_letter)
             timer.args = (timer,)
             self.__quiz_timer = timer
             self.__quiz_timer.start()
             self.__quiz_timeout_set = True
 
 
-    def quizGuess(self, author_id, message):
+    def quiz_guess(self, author_id, message):
         """Makes a quiz guess and shows new question if guess is correct"""
         # Might be an answer but answers are not accepted
         if self.mquiz.acceptsAnswer():
@@ -266,7 +267,7 @@ class ArnoldBot(fbchat.Client):
                 self.__quiz_timer.cancel()
                 self.__quiz_timer = None
                 self.__quiz_timeout_set = False
-                self.quizGiveQuestion()
+                self.quiz_give_question()
 
     
     def cmd_simple(self, author_id, command_name, args):
@@ -286,7 +287,7 @@ class ArnoldBot(fbchat.Client):
     ############
     ### Commands
     ############
-    
+
     def cmd_fullwidth(self, author_id, command, args):
         """Converts to full-width chars"""
         try:
@@ -297,8 +298,47 @@ class ArnoldBot(fbchat.Client):
 
             for i in args:
                 # Space doesn't convert well
-                if i == " ": msg += u"　"
-                else: msg += chr(0xFEE0 + ord(i))
+                if i == " ":
+                    msg += u"　"
+                elif i == "\n":
+                    msg += u"\n"
+                else:
+                    msg += chr(0xFEE0 + ord(i))
+
+            self.send_default(msg)
+
+        except:
+            self.command_log_error()
+
+    def cmd_fullwidth_square(self, author_id, command, args):
+        """Converts to full-width chars with square like text"""
+        try:
+            if not args: raise Exception
+
+            def to_fullwidth(char):
+                # Space doesn't convert well
+                if char == " ":
+                    return u"　"
+                elif char == "\n":
+                    return u"\n"
+                else:
+                    return chr(0xFEE0 + ord(char))
+
+            args = quiz.unidecode(args)
+            msg = ""
+
+            for i in args:
+                msg += to_fullwidth(i)
+
+            for i, letter in enumerate(args[1:-1:]):
+                msg += "\n" + to_fullwidth(letter)
+                msg += ' ' * int(3.7 * (len(args) - 2))  # Every letter occupies 3.7 space letters
+                msg += ' ' * len(re.findall(' +', args[1:-1:]))  # Extra letter for each space in word
+                msg += to_fullwidth(args[-(i + 2)])
+
+            msg += "\n"
+            for i in args[::-1]:
+                msg += to_fullwidth(i)
 
             self.send_default(msg)
 
@@ -433,30 +473,22 @@ class ArnoldBot(fbchat.Client):
     def cmd_urban_dict(self, author_id, command, args):
         """Shows urban dictionary entry"""
         try:
-            if args == None: raise Exception
-            
-            # Number of defitinios
-            count = 1
-            if re.match(r"\s\d", args[-2:]):
-                count = int(args[-1])
+            if args is None:
+                raise Exception
 
-            args = args[:-2].replace(" ", "+")
+            args = args.replace(" ", "+")
             url = "http://api.urbandictionary.com/v0/define?term="
             url += args
 
             response = json.load(urllib.request.urlopen(url))
-
 
             # Page not found
             if response["result_type"] == "no_results":
                 self.send_default(command["txt_error"])
                 return
 
-            if count < 1: count = 1
-            if count > len(response["list"]): count = len(response["list"])
-
             msg = ""
-            for i in range(count):
+            for i in range(2):
                 result = response["list"][i]
                 word = result["word"]
                 definition = result["definition"]
@@ -506,8 +538,6 @@ class ArnoldBot(fbchat.Client):
 
             msg = random.choice(unfair_list)
             self.send_default(msg)
-            # self.send_defaultLike(like = Like.small)
-
 
         except:
             self.command_log_error()
@@ -517,9 +547,8 @@ class ArnoldBot(fbchat.Client):
         try:
             args = int(args)
             roll = random.randint(0, args)
-            msg = command[consts.Cmd.TXT_EXECUTED] #  % (self.getNickname(self.fbidToNameCode(author_id)), roll)
+            msg = command[consts.Cmd.TXT_EXECUTED] % self.fbidToName(author_id, roll)
             self.send_default(msg)
-
 
         except:
             self.command_log_error()
@@ -546,6 +575,7 @@ class ArnoldBot(fbchat.Client):
         except:
             self.command_log_error()
 
+
     def cmd_simpleCommands(self, author_id, command, args):
         """Adds a command to simple_commands list."""
         try:
@@ -559,7 +589,7 @@ class ArnoldBot(fbchat.Client):
                 command["commands"][new_command_name] = [args[1]]
 
             with open(CONFIG_FILE, "w", encoding = "utf-8") as outfile:
-                json.dump(self.config, outfile, indent = "\t", ensure_ascii = False)
+                json.dump(self.config, outfile, indent="\t", ensure_ascii=False)
 
             self.send_default(command[consts.Cmd.TXT_EXECUTED] % new_command_name)
 
@@ -587,11 +617,11 @@ class ArnoldBot(fbchat.Client):
                         if self.__quiz_timeout_set:
                             self.send_default("%s\n\n%s" % (self.mquiz.getQuestion(), self.mquiz.getHiddenAnswer()))
                         else:
-                            self.quizGiveQuestion()
+                            self.quiz_give_question()
 
                     elif key == "get_question":
                         self.command_log(command[consts.Cmd.NAME], args)
-                        self.quizGiveQuestion()
+                        self.quiz_give_question()
 
                     elif key == "user_stats":
                         self.command_log(command[consts.Cmd.NAME], args)
@@ -620,7 +650,7 @@ class ArnoldBot(fbchat.Client):
                     break
             # Command not found, it is a guess
             else:
-                self.quizGuess(author_id, " ".join(args))
+                self.quiz_guess(author_id, " ".join(args))
         except Exception as e:
             self.command_log_error(str(e))
 
@@ -795,15 +825,6 @@ class ArnoldBot(fbchat.Client):
             if user["firstName"].lower() == name:
                 return user["id"]
 
-    def fbidToNameCode(self, fbid):
-        for user in self.full_users:
-            if user["id"] == fbid:
-                return user["firstName"] + fbid[-3:]
-
-    def nameCodeToFbid(self, name_code):
-        for user in self.full_users:
-            if user["id"][-3:] == name_code[-3:] and user["firstName"] == user["id"][:-3]:
-                return user["id"]
     
     def getAddressingName(self, name_code):
         user = self.config[consts.Config.USERS].get(name_code, None)
@@ -842,6 +863,7 @@ if len(sys.argv) >= 3:
 with open(CONFIG_FILE, encoding="utf-8") as infile:
     my_config = json.load(infile)
 
-ctypes.windll.kernel32.SetConsoleTitleW(my_config["bot_name"])
+# ctypes.windll.kernel32.SetConsoleTitleW(my_config["bot_name"])
 
-bot = ArnoldBot(my_config[consts.Config.EMAIL], my_config[consts.Config.PASSWORD], my_config)
+with daemon.DaemonContext():
+    bot = ArnoldBot(my_config[consts.Config.EMAIL], my_config[consts.Config.PASSWORD], my_config)
